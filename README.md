@@ -1,4 +1,4 @@
-### Graduate Innovative Hackathon 2025
+### GradInno Hackathon 2025 - Final project
 
 # MediDet-AI : A Multi-modal RAG Application
 MediDet-AI is an innovative, tech-forward healthcare assistant application designed to empower users to monitor their general health, with a specialized feature for skin disease detection.
