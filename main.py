@@ -22,15 +22,13 @@ from pinecone import Pinecone
 import openai
 import whisper
 import tempfile
+import hashlib
 # --- Page Config ---
 st.set_page_config(
     page_title="MediDet-AI",
     page_icon="🕵️‍♂️",
     layout="wide",
 )
-
-global uploaded
-uploaded=False
 
 def load_lottie_url(path: str):
     with open(path, "r") as file:
@@ -252,6 +250,34 @@ llm=ChatOpenAI(api_key=os.environ['OPENAI_API_KEY'],
 
 vectorstore = PineconeVectorStore(index_name=index_name, embedding=embed)
 
+
+def analyze_image(image_bytes: bytes) -> str:
+    """Analyze an image and return a diagnosis without mutating chat history."""
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, preprocess = clip.load("ViT-B/32", device=device)
+    image_tensor = preprocess(image).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        image_features = model.encode_image(image_tensor)
+        image_features /= image_features.norm(dim=-1, keepdim=True)
+
+    vector = image_features.cpu().numpy().flatten()
+    pc = Pinecone(api_key=os.environ['PINECONE_API_KEY'])
+    index = pc.Index("skindisease-symptoms-gpt-4")
+    result = index.query(
+        vector=vector.reshape(1, -1).tolist(),
+        top_k=1,
+        include_metadata=True,
+    )
+    condition = result['matches'][0]['metadata']['Disease']
+    prompt_template = '''Accept the user’s skin condition as input and provide probable diagnoses and prescription for only that condition.
+    Text:
+    {context}'''
+    prompt = PromptTemplate(template=prompt_template, input_variables=["context"])
+    chain = LLMChain(llm=llm, prompt=prompt)
+    return chain.run(condition)
+
 if "messages" not in st.session_state:
     st.session_state["messages"] = [{"role": "assistant", "content": "Hello! MediDet AI is here to help you diagnose symptoms. How can I assist you today?"
 }]
@@ -278,71 +304,36 @@ with st.sidebar:
     option = st.radio("Choose method:", ["Upload Image", "Open Camera"])
     st.markdown("</div>", unsafe_allow_html=True)
 
-    image_data = None
+    image_file = None
     if option == "Upload Image":
-        uploaded = st.file_uploader("Drop the evidence (jpg/png)", type=['jpg', 'png'])
-        if uploaded:
-            image = Image.open(uploaded)
-            st.image(image, caption="📁 Exhibit A", use_column_width=True)
-            image_data = image
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            model, preprocess = clip.load("ViT-B/32", device=device)
-            image = image_data.convert("RGB")
-            image_tensor = preprocess(image).unsqueeze(0).to(device)
-            with torch.no_grad():
-                image_features = model.encode_image(image_tensor)
-                image_features /= image_features.norm(dim=-1, keepdim=True)
-                vector = image_features.cpu().numpy().flatten()
-                st.success("✅ Image converted to CLIP vector!")
-                st.write("Vector (first 10 values):", vector.shape)
-                index_name = "skindisease-symptoms-gpt-4"
-                pc = Pinecone(api_key=os.environ['PINECONE_API_KEY'])
-                index = pc.Index(index_name)
-                rv=vector.reshape(1, -1)
-                result= index.query(vector=rv.tolist(), top_k=1, include_metadata=True)
-                prompt=result['matches'][0]['metadata']['Disease']
-                st.write(prompt)
-                prompt_template='''Accept the user’s skin condition as input and provide probable diagnoses and prescription for only that condition.    
-                Text:
-                {context}'''
-                PROMPT = PromptTemplate(
-                template=prompt_template,input_variables=["context"])
-                chain = LLMChain(llm=llm, prompt=PROMPT)
-                answer=chain.run(prompt)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
+        image_file = st.file_uploader("Drop the evidence (jpg/png)", type=['jpg', 'png'])
+        image_caption = "📁 Exhibit A"
 
     elif option == "Open Camera":
-        
-        cam = st.camera_input("Live Surveillance")
-        if cam:
-            image = Image.open(cam)
-            st.image(image, caption="📸 Snapshot captured!", use_column_width=True)
-            image_data = image
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            model, preprocess = clip.load("ViT-B/32", device=device)
-            image = image_data.convert("RGB")
-            image_tensor = preprocess(image).unsqueeze(0).to(device)
-            with torch.no_grad():
-                image_features = model.encode_image(image_tensor)
-                image_features /= image_features.norm(dim=-1, keepdim=True)
-                vector = image_features.cpu().numpy().flatten()
-                st.success("✅ Image converted to CLIP vector!")
-                st.write("Vector (first 10 values):", vector.shape)
-                index_name = "skindisease-symptoms-gpt-4"
-                pc = Pinecone(api_key=os.environ['PINECONE_API_KEY'])
-                index = pc.Index(index_name)
-                rv=vector.reshape(1, -1)
-                result= index.query(vector=rv.tolist(), top_k=1, include_metadata=True)
-                prompt=result['matches'][0]['metadata']['Disease']
-                st.write(prompt)
-                prompt_template='''Accept the user’s skin condition as input and provide probable diagnoses and prescription for only that condition.    
-                Text:
-                {context}'''
-                PROMPT = PromptTemplate(
-                template=prompt_template,input_variables=["context"])
-                chain = LLMChain(llm=llm, prompt=PROMPT)
-                answer=chain.run(prompt)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
+        image_file = st.camera_input("Live Surveillance")
+        image_caption = "📸 Snapshot captured!"
+
+    if image_file:
+        image_bytes = image_file.getvalue()
+        image_identifier = hashlib.sha256(image_bytes).hexdigest()
+        st.session_state["image_identifier"] = image_identifier
+        st.image(
+            Image.open(io.BytesIO(image_bytes)),
+            caption=image_caption,
+            use_column_width=True,
+        )
+
+        analyze_requested = st.button("Analyze", key="analyze_image")
+        image_changed = (
+            st.session_state.get("analyzed_image_identifier") != image_identifier
+        )
+        if image_changed or analyze_requested:
+            with st.spinner("Analyzing image evidence..."):
+                st.session_state["image_diagnosis"] = analyze_image(image_bytes)
+                st.session_state["analyzed_image_identifier"] = image_identifier
+
+        if st.session_state.get("image_diagnosis"):
+            st.success(st.session_state["image_diagnosis"])
 
 
 flag = st.toggle("Audio")
@@ -391,10 +382,6 @@ else:
     st.title("Continuous Speech to Text")
     st.title("Currently still in developing phase")
     
-if option == "Open Camera" and cam:
-        st.chat_message("assistant").write(answer)
-if uploaded:
-        st.chat_message("assistant").write(answer)
 if st.button('clear'):
     h.update_one({"id": 'krrish'},{"$set": {"text": ""}})
 
