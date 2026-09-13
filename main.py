@@ -9,11 +9,10 @@ import re
 from dotenv import load_dotenv,dotenv_values
 from langchain_pinecone import PineconeVectorStore
 from langchain_openai import OpenAIEmbeddings
-from langchain_core.vectorstores import VectorStoreRetriever
-from langchain.chains import RetrievalQA
-from langchain.chains import LLMChain
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_openai import ChatOpenAI
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 import io
 import speech_recognition as sr
 import torch
@@ -243,11 +242,11 @@ index_name = "disease-symptoms-gpt-4"
 
 embed = OpenAIEmbeddings(
 model='text-embedding-ada-002',
-openai_api_key=os.environ.get('OPEN_API_KEY')
+api_key=os.environ['OPENAI_API_KEY']
 )
 
 llm=ChatOpenAI(api_key=os.environ['OPENAI_API_KEY'],
-                   model_name='gpt-4o',
+                   model='gpt-4o',
                    temperature=0.0)
 
 vectorstore = PineconeVectorStore(index_name=index_name, embedding=embed)
@@ -299,7 +298,7 @@ with st.sidebar:
                 pc = Pinecone(api_key=os.environ['PINECONE_API_KEY'])
                 index = pc.Index(index_name)
                 rv=vector.reshape(1, -1)
-                result= index.query(vector=rv.tolist(), top_k=1, include_metadata=True)
+                result= index.query(vector=rv.flatten().tolist(), top_k=1, include_metadata=True)
                 prompt=result['matches'][0]['metadata']['Disease']
                 st.write(prompt)
                 prompt_template='''Accept the user’s skin condition as input and provide probable diagnoses and prescription for only that condition.    
@@ -307,8 +306,8 @@ with st.sidebar:
                 {context}'''
                 PROMPT = PromptTemplate(
                 template=prompt_template,input_variables=["context"])
-                chain = LLMChain(llm=llm, prompt=PROMPT)
-                answer=chain.run(prompt)
+                chain = PROMPT | llm
+                answer=chain.invoke({"context": prompt}).content
                 st.session_state.messages.append({"role": "assistant", "content": answer})
 
     elif option == "Open Camera":
@@ -332,7 +331,7 @@ with st.sidebar:
                 pc = Pinecone(api_key=os.environ['PINECONE_API_KEY'])
                 index = pc.Index(index_name)
                 rv=vector.reshape(1, -1)
-                result= index.query(vector=rv.tolist(), top_k=1, include_metadata=True)
+                result= index.query(vector=rv.flatten().tolist(), top_k=1, include_metadata=True)
                 prompt=result['matches'][0]['metadata']['Disease']
                 st.write(prompt)
                 prompt_template='''Accept the user’s skin condition as input and provide probable diagnoses and prescription for only that condition.    
@@ -340,8 +339,8 @@ with st.sidebar:
                 {context}'''
                 PROMPT = PromptTemplate(
                 template=prompt_template,input_variables=["context"])
-                chain = LLMChain(llm=llm, prompt=PROMPT)
-                answer=chain.run(prompt)
+                chain = PROMPT | llm
+                answer=chain.invoke({"context": prompt}).content
                 st.session_state.messages.append({"role": "assistant", "content": answer})
 
 
@@ -358,22 +357,23 @@ if not flag:
         st.markdown('<div class="typing">🕵️‍♂️ Skin Scout is investigating your case...</div>', unsafe_allow_html=True)
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
-        chain = LLMChain(llm=llm, prompt=PROMPT)
-        answer=chain.run(prompt)
+        chain = PROMPT | llm
+        answer=chain.invoke({"context": prompt}).content
         if re.search(r'\bYes\b', answer):
-            prompt_template='''Accept the user’s symptoms as input and provide probable diseases, diagnoses and prescription using only the information stored in the vector database. politely inform the user that the data is insufficient to provide a diagnosis when the given prompt is not relavent to Medical Symptoms.    
-            Text:
-            {context}'''
+            prompt_template='''Accept the user’s symptoms as input and provide probable diseases, diagnoses and prescription using only the information stored in the vector database. Politely inform the user that the data is insufficient to provide a diagnosis when the given prompt is not relevant to medical symptoms.
+            Retrieved information:
+            {context}
+            User symptoms:
+            {input}'''
             PROMPT = PromptTemplate(
-                template=prompt_template, input_variables=["context"]
+                template=prompt_template, input_variables=["context", "input"]
             )
-            retriever = VectorStoreRetriever(vectorstore=vectorstore)
-            qa_chain = RetrievalQA.from_chain_type(llm=llm,
-                    chain_type="stuff",
-                        retriever=retriever,
-                        chain_type_kwargs={"prompt": PROMPT},)
+            document_chain = create_stuff_documents_chain(llm, PROMPT)
+            qa_chain = create_retrieval_chain(
+                vectorstore.as_retriever(), document_chain
+            )
 
-            answer = qa_chain.run(query=prompt)
+            answer = qa_chain.invoke({"input": prompt})["answer"]
             st.session_state.messages.append({"role": "assistant", "content": answer})
             st.chat_message("assistant").write(answer)
         else:
@@ -382,9 +382,10 @@ if not flag:
                 {context}'''
             PROMPT = PromptTemplate(
             template=prompt_template, input_variables=["context"])
-            chain = LLMChain(llm=llm, prompt=PROMPT).run(prompt)
-            st.session_state.messages.append({"role": "assistant", "content": chain})
-            st.chat_message("assistant").write(chain)
+            chain = PROMPT | llm
+            answer = chain.invoke({"context": prompt}).content
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            st.chat_message("assistant").write(answer)
 
 else:
     # Set up Streamlit app layout
