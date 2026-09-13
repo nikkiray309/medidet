@@ -29,6 +29,12 @@ st.set_page_config(
     layout="wide",
 )
 
+INITIAL_ASSISTANT_GREETING = (
+    "Hello! MediDet AI is here to help you diagnose symptoms. "
+    "How can I assist you today?"
+)
+IMAGE_RESULT_STATE_KEYS = ("image_data", "image_result")
+
 global uploaded
 uploaded=False
 
@@ -253,8 +259,9 @@ llm=ChatOpenAI(api_key=os.environ['OPENAI_API_KEY'],
 vectorstore = PineconeVectorStore(index_name=index_name, embedding=embed)
 
 if "messages" not in st.session_state:
-    st.session_state["messages"] = [{"role": "assistant", "content": "Hello! MediDet AI is here to help you diagnose symptoms. How can I assist you today?"
-}]
+    st.session_state["messages"] = [
+        {"role": "assistant", "content": INITIAL_ASSISTANT_GREETING}
+    ]
 
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
@@ -395,7 +402,12 @@ if option == "Open Camera" and cam:
         st.chat_message("assistant").write(answer)
 if uploaded:
         st.chat_message("assistant").write(answer)
-if st.button('clear'):
-    h.update_one({"id": 'krrish'},{"$set": {"text": ""}})
+if st.button("clear"):
+    st.session_state["messages"] = [
+        {"role": "assistant", "content": INITIAL_ASSISTANT_GREETING}
+    ]
+    for key in IMAGE_RESULT_STATE_KEYS:
+        st.session_state.pop(key, None)
+    st.rerun()
 
 
