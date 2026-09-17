@@ -1,27 +1,110 @@
-/* skin_scout_app/styles/custom.css */
-.stApp {
-    background: linear-gradient(to bottom, #4A2E1D, #2E1C12);
-    color: #D9C2A7;
-    font-family: 'Courier New', Courier, monospace;
+@import url("https://fonts.googleapis.com/css2?family=Special+Elite&display=swap");
+
+html,
+body {
+    background-image: url("https://images.unsplash.com/photo-1603126855021-4022415d0d2e?auto=format&fit=crop&w=1650&q=80");
+    background-size: cover;
+    background-attachment: fixed;
+    background-position: center;
+    color: #e0d8c3;
+    font-family: "Special Elite", Courier, monospace;
 }
 
-.sticky-note {
-    background: #D9C2A7;
-    padding: 10px;
-    border-radius: 5px;
-    box-shadow: 2px 2px 5px rgba(0, 0, 0, 0.3);
+.app-title {
+    color: #f4d35e;
+    font-family: "Special Elite";
+    font-size: 36px;
+    text-align: center;
 }
 
-.chat-bubble {
-    background: #D9C2A7;
-    padding: 8px;
-    margin: 5px;
-    border-radius: 8px;
-    border-left: 4px solid #E57373;
+.app-subtitle {
+    color: #e0d8c3;
+    font-family: "Special Elite";
+    font-size: 24px;
+    text-align: center;
 }
 
-.diagnosis {
-    color: #E57373;
+.sidebar-title {
+    color: #fff;
+    font-family: "Special Elite";
+    font-size: 20px;
+    text-align: left;
+}
+
+.container {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    justify-content: center;
+    margin: 20px;
+}
+
+.emoji {
+    font-size: 60px;
+    line-height: 1;
+}
+
+.bubble {
+    position: relative;
+    max-width: 400px;
+    padding: 20px;
+    border: 2px dashed #f4d35e;
+    border-radius: 15px;
+    background: rgb(61 61 61 / 85%);
+    color: #fff;
+    font-family: "Special Elite", Courier, monospace;
+    font-size: 17px;
+}
+
+.bubble:hover {
+    cursor: zoom-in;
+    box-shadow: 0 0 10px #f4d35e;
+}
+
+.stButton button {
+    padding: 0.5em 1em;
+    border: 0;
+    border-radius: 10px;
+    background-color: #f4d35e !important;
+    color: #000 !important;
     font-weight: bold;
+    transition: background-color 0.3s ease, transform 0.2s ease;
+}
+
+.stButton button:hover {
+    background-color: #fc0 !important;
+    transform: scale(1.1);
+}
+
+.stRadio > div {
+    padding: 10px;
+    border-radius: 10px;
+    background-color: rgb(46 46 46 / 85%);
+    font-family: "Special Elite";
+}
+
+.stImage img {
+    border: 3px solid #f4d35e;
+    border-radius: 8px;
+}
+
+.typing {
+    display: inline-block;
+    width: 0;
+    overflow: hidden;
+    border-right: 4px solid #f4d35e;
+    color: #fff;
+    font-family: "Special Elite";
     font-size: 18px;
+    white-space: nowrap;
+    animation: typing 3s steps(30) 1s 1 normal both, blink 0.75s step-end infinite;
+}
+
+@keyframes typing {
+    from { width: 0; }
+    to { width: 100%; }
+}
+
+@keyframes blink {
+    50% { border-color: transparent; }
 }
