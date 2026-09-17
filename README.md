@@ -54,3 +54,26 @@ Next Steps:
 · Add an agent to detect whether the given image is a Human Face or not.
 
 · And able to address many skin diseases.
+
+## Deployment configuration and health check
+
+Configure these values in Streamlit secrets (or as environment variables when
+running the health check). Index names are deployment configuration and are not
+embedded in application code:
+
+```toml
+OPENAI_API_KEY = "..."
+PINECONE_API_KEY = "..."
+TEXT_INDEX_NAME = "..."
+IMAGE_INDEX_NAME = "..."
+TEXT_EMBEDDING_DIMENSION = 1536
+IMAGE_EMBEDDING_DIMENSION = 512
+```
+
+Before deploying, run the metadata-only health check. It verifies that both
+indexes exist and their dimensions match configuration; it does not submit a
+query, image, embedding, or other user data:
+
+```bash
+python health_check.py
+```
