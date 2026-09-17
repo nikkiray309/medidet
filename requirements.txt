@@ -6,10 +6,7 @@ langchain-openai
 langchain-core
 langchain
 pandas
-pydub
 git+https://github.com/openai/CLIP.git
-git+https://github.com/openai/whisper.git
 torch
 clip
-SpeechRecognition
 pip==25.0

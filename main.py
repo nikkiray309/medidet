@@ -14,14 +14,9 @@ from langchain.chains import RetrievalQA
 from langchain.chains import LLMChain
 from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
-import io
-import speech_recognition as sr
 import torch
 import clip
 from pinecone import Pinecone
-import openai
-import whisper
-import tempfile
 # --- Page Config ---
 st.set_page_config(
     page_title="MediDet-AI",
@@ -345,51 +340,44 @@ with st.sidebar:
                 st.session_state.messages.append({"role": "assistant", "content": answer})
 
 
-flag = st.toggle("Audio")
-if not flag:
-    prompt_template='''If Medical Symptoms type yes else give politely inform the user that the data is insufficient to provide a diagnosis   
+prompt_template='''If Medical Symptoms type yes else give politely inform the user that the data is insufficient to provide a diagnosis
     Text:
     {context}'''
-    PROMPT = PromptTemplate(
+PROMPT = PromptTemplate(
     template=prompt_template, input_variables=["context"]
-    )
+)
 
-    if prompt := st.chat_input():
-        st.markdown('<div class="typing">🕵️‍♂️ Skin Scout is investigating your case...</div>', unsafe_allow_html=True)
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        st.chat_message("user").write(prompt)
-        chain = LLMChain(llm=llm, prompt=PROMPT)
-        answer=chain.run(prompt)
-        if re.search(r'\bYes\b', answer):
-            prompt_template='''Accept the user’s symptoms as input and provide probable diseases, diagnoses and prescription using only the information stored in the vector database. politely inform the user that the data is insufficient to provide a diagnosis when the given prompt is not relavent to Medical Symptoms.    
+if prompt := st.chat_input():
+    st.markdown('<div class="typing">🕵️‍♂️ Skin Scout is investigating your case...</div>', unsafe_allow_html=True)
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    st.chat_message("user").write(prompt)
+    chain = LLMChain(llm=llm, prompt=PROMPT)
+    answer=chain.run(prompt)
+    if re.search(r'\bYes\b', answer):
+        prompt_template='''Accept the user’s symptoms as input and provide probable diseases, diagnoses and prescription using only the information stored in the vector database. politely inform the user that the data is insufficient to provide a diagnosis when the given prompt is not relavent to Medical Symptoms.
             Text:
             {context}'''
-            PROMPT = PromptTemplate(
-                template=prompt_template, input_variables=["context"]
-            )
-            retriever = VectorStoreRetriever(vectorstore=vectorstore)
-            qa_chain = RetrievalQA.from_chain_type(llm=llm,
-                    chain_type="stuff",
-                        retriever=retriever,
-                        chain_type_kwargs={"prompt": PROMPT},)
+        PROMPT = PromptTemplate(
+            template=prompt_template, input_variables=["context"]
+        )
+        retriever = VectorStoreRetriever(vectorstore=vectorstore)
+        qa_chain = RetrievalQA.from_chain_type(llm=llm,
+                chain_type="stuff",
+                    retriever=retriever,
+                    chain_type_kwargs={"prompt": PROMPT},)
 
-            answer = qa_chain.run(query=prompt)
-            st.session_state.messages.append({"role": "assistant", "content": answer})
-            st.chat_message("assistant").write(answer)
-        else:
-            prompt_template='''Accept the queries as a customer care and generate an accurate reply.   
-                Text:
-                {context}'''
-            PROMPT = PromptTemplate(
-            template=prompt_template, input_variables=["context"])
-            chain = LLMChain(llm=llm, prompt=PROMPT).run(prompt)
-            st.session_state.messages.append({"role": "assistant", "content": chain})
-            st.chat_message("assistant").write(chain)
-
-else:
-    # Set up Streamlit app layout
-    st.title("Continuous Speech to Text")
-    st.title("Currently still in developing phase")
+        answer = qa_chain.run(query=prompt)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        st.chat_message("assistant").write(answer)
+    else:
+        prompt_template='''Accept the queries as a customer care and generate an accurate reply.
+            Text:
+            {context}'''
+        PROMPT = PromptTemplate(
+        template=prompt_template, input_variables=["context"])
+        chain = LLMChain(llm=llm, prompt=PROMPT).run(prompt)
+        st.session_state.messages.append({"role": "assistant", "content": chain})
+        st.chat_message("assistant").write(chain)
     
 if option == "Open Camera" and cam:
         st.chat_message("assistant").write(answer)
