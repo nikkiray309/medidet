@@ -5,7 +5,6 @@ from streamlit_lottie import st_lottie
 import json
 import base64
 import os
-import re
 from dotenv import load_dotenv,dotenv_values
 from langchain_pinecone import PineconeVectorStore
 from langchain_openai import OpenAIEmbeddings
@@ -22,6 +21,7 @@ from pinecone import Pinecone
 import openai
 import whisper
 import tempfile
+from routing import MedicalRoute, SAFE_CLARIFICATION_RESPONSE, classify_message
 # --- Page Config ---
 st.set_page_config(
     page_title="MediDet-AI",
@@ -347,20 +347,12 @@ with st.sidebar:
 
 flag = st.toggle("Audio")
 if not flag:
-    prompt_template='''If Medical Symptoms type yes else give politely inform the user that the data is insufficient to provide a diagnosis   
-    Text:
-    {context}'''
-    PROMPT = PromptTemplate(
-    template=prompt_template, input_variables=["context"]
-    )
-
     if prompt := st.chat_input():
         st.markdown('<div class="typing">🕵️‍♂️ Skin Scout is investigating your case...</div>', unsafe_allow_html=True)
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
-        chain = LLMChain(llm=llm, prompt=PROMPT)
-        answer=chain.run(prompt)
-        if re.search(r'\bYes\b', answer):
+        route = classify_message(llm, prompt)
+        if route == MedicalRoute.MEDICAL:
             prompt_template='''Accept the user’s symptoms as input and provide probable diseases, diagnoses and prescription using only the information stored in the vector database. politely inform the user that the data is insufficient to provide a diagnosis when the given prompt is not relavent to Medical Symptoms.    
             Text:
             {context}'''
@@ -376,7 +368,7 @@ if not flag:
             answer = qa_chain.run(query=prompt)
             st.session_state.messages.append({"role": "assistant", "content": answer})
             st.chat_message("assistant").write(answer)
-        else:
+        elif route == MedicalRoute.NON_MEDICAL:
             prompt_template='''Accept the queries as a customer care and generate an accurate reply.   
                 Text:
                 {context}'''
@@ -385,6 +377,11 @@ if not flag:
             chain = LLMChain(llm=llm, prompt=PROMPT).run(prompt)
             st.session_state.messages.append({"role": "assistant", "content": chain})
             st.chat_message("assistant").write(chain)
+        else:
+            st.session_state.messages.append(
+                {"role": "assistant", "content": SAFE_CLARIFICATION_RESPONSE}
+            )
+            st.chat_message("assistant").write(SAFE_CLARIFICATION_RESPONSE)
 
 else:
     # Set up Streamlit app layout
