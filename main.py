@@ -32,10 +32,92 @@ st.set_page_config(
 global uploaded
 uploaded=False
 
+MEDICAL_DISCLAIMER = """
+**Medical disclaimer:** MediDet-AI provides general educational information only. It
+does not provide a diagnosis, treatment plan, or prescription and is not a substitute
+for care from a qualified health professional. Images and AI-generated text can be
+incomplete or wrong. If you may be experiencing a medical emergency, contact your
+local emergency services now. Seek professional evaluation for symptoms that are
+serious, worsening, or persistent.
+"""
+
+RED_FLAG_PATTERNS = {
+    "difficulty breathing": r"\b(can'?t breathe|cannot breathe|difficulty breathing|shortness of breath|choking)\b",
+    "chest pain": r"\b(chest pain|chest pressure|crushing chest)\b",
+    "possible stroke": r"\b(face droop|facial droop|slurred speech|one[- ]sided weakness|sudden weakness)\b",
+    "severe allergic reaction": r"\b(anaphylaxis|throat (?:is )?closing|swollen tongue|tongue swelling)\b",
+    "loss of consciousness": r"\b(unconscious|passed out|loss of consciousness|not waking)\b",
+    "severe bleeding": r"\b(severe bleeding|bleeding (?:won't|will not) stop|hemorrhag)\b",
+    "suicide or self-harm risk": r"\b(kill myself|suicid(?:e|al)|self[- ]harm|hurt myself)\b",
+}
+
+
+def detect_emergency_red_flags(text):
+    """Return educational red-flag labels found in user-provided text."""
+    normalized_text = text or ""
+    return [
+        label
+        for label, pattern in RED_FLAG_PATTERNS.items()
+        if re.search(pattern, normalized_text, flags=re.IGNORECASE)
+    ]
+
+
+def source_metadata(metadata):
+    """Keep source provenance visible without treating it as generated guidance."""
+    return metadata or {"metadata": "No source metadata was supplied."}
+
+
+CLINICAL_GUIDANCE_PROMPT = """
+You are providing cautious, general health education, not medical care.
+
+RETRIEVED EVIDENCE:
+{context}
+
+USER'S DESCRIPTION:
+{question}
+
+Rules:
+- Never state or imply a definitive diagnosis. Present a short list of possible
+  explanations using uncertainty language (for example, "could," "may," or
+  "one possibility") and explain that an in-person assessment may differ.
+- Do not prescribe, recommend, name, dose, start, stop, or change medication.
+- Clearly label separate sections "Retrieved evidence" and "Generated educational
+  guidance." Do not represent generated statements as retrieved facts.
+- Mention important limitations and useful questions a clinician may ask.
+- If the description suggests emergency warning signs (including trouble breathing,
+  chest pain, stroke signs, anaphylaxis, loss of consciousness, severe bleeding, or
+  imminent self-harm), begin with an "Emergency" section instructing the user to
+  contact local emergency services now. Do not delay that instruction with analysis.
+- Advise evaluation by an appropriately qualified health professional for serious,
+  worsening, or persistent symptoms. Do not give false reassurance.
+- If evidence is insufficient or unrelated, say so plainly rather than guessing.
+- End with: "This is educational information, not a diagnosis or treatment plan."
+"""
+
+IMAGE_GUIDANCE_PROMPT = """
+You are providing cautious, general educational information about an image match.
+
+RETRIEVED IMAGE-MATCH EVIDENCE AND METADATA:
+{context}
+
+Rules:
+- An image similarity match is not a diagnosis. Never claim a definitive diagnosis.
+- Present possible explanations only as uncertain educational information.
+- Do not prescribe, recommend, name, dose, start, stop, or change medication.
+- Clearly separate "Retrieved evidence" from "Generated educational guidance," and
+  identify the retrieved item as a similarity result rather than a clinical finding.
+- Explain image-only limitations and advise professional evaluation, especially for
+  serious, rapidly changing, painful, infected-looking, or persistent skin symptoms.
+- Tell the user to contact local emergency services now for emergency warning signs
+  such as trouble breathing, facial/throat swelling, fainting, or a rapidly spreading
+  severe reaction.
+- End with: "This is educational information, not a diagnosis or treatment plan."
+"""
+
 def load_lottie_url(path: str):
     with open(path, "r") as file:
         return json.load(file)
-    
+
 # Path to your det.json animation
 lottie_animation = load_lottie_url("assets/detwalking.json")
 
@@ -235,6 +317,20 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+st.warning(MEDICAL_DISCLAIMER)
+acknowledged = st.checkbox(
+    "I have read and understand the medical disclaimer and want to continue.",
+    key="medical_disclaimer_acknowledged",
+)
+st.caption(
+    "Deployment requirement: the final clinical wording and escalation rules must "
+    "be reviewed and approved by appropriately qualified medical and legal/compliance "
+    "reviewers before this application is made public."
+)
+if not acknowledged:
+    st.info("Please acknowledge the disclaimer before using MediDet-AI.")
+    st.stop()
+
 config = dotenv_values("keys.env")
 os.environ['OPENAI_API_KEY'] = st.secrets["OPENAI_API_KEY"]
 os.environ['PINECONE_API_KEY'] = st.secrets["PINECONE_API_KEY"]
@@ -252,8 +348,29 @@ llm=ChatOpenAI(api_key=os.environ['OPENAI_API_KEY'],
 
 vectorstore = PineconeVectorStore(index_name=index_name, embedding=embed)
 
+
+def present_image_match(result):
+    """Expose image-match evidence, then generate separately labelled guidance."""
+    matches = result.get("matches", [])
+    if not matches:
+        st.warning("No image-match evidence was retrieved; no guidance was generated.")
+        return None
+
+    match = matches[0]
+    evidence = {
+        "match_id": match.get("id"),
+        "similarity_score": match.get("score"),
+        "metadata": source_metadata(match.get("metadata")),
+    }
+    st.subheader("Retrieved source metadata")
+    st.json(evidence)
+
+    prompt = PromptTemplate(template=IMAGE_GUIDANCE_PROMPT, input_variables=["context"])
+    answer = LLMChain(llm=llm, prompt=prompt).run(json.dumps(evidence, default=str))
+    return answer
+
 if "messages" not in st.session_state:
-    st.session_state["messages"] = [{"role": "assistant", "content": "Hello! MediDet AI is here to help you diagnose symptoms. How can I assist you today?"
+    st.session_state["messages"] = [{"role": "assistant", "content": "Hello! MediDet-AI can provide cautious educational information about symptoms, but cannot diagnose or prescribe. How can I help?"
 }]
 
 for msg in st.session_state.messages:
@@ -300,19 +417,12 @@ with st.sidebar:
                 index = pc.Index(index_name)
                 rv=vector.reshape(1, -1)
                 result= index.query(vector=rv.tolist(), top_k=1, include_metadata=True)
-                prompt=result['matches'][0]['metadata']['Disease']
-                st.write(prompt)
-                prompt_template='''Accept the user’s skin condition as input and provide probable diagnoses and prescription for only that condition.    
-                Text:
-                {context}'''
-                PROMPT = PromptTemplate(
-                template=prompt_template,input_variables=["context"])
-                chain = LLMChain(llm=llm, prompt=PROMPT)
-                answer=chain.run(prompt)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
+                answer = present_image_match(result)
+                if answer:
+                    st.session_state.messages.append({"role": "assistant", "content": answer})
 
     elif option == "Open Camera":
-        
+
         cam = st.camera_input("Live Surveillance")
         if cam:
             image = Image.open(cam)
@@ -333,21 +443,14 @@ with st.sidebar:
                 index = pc.Index(index_name)
                 rv=vector.reshape(1, -1)
                 result= index.query(vector=rv.tolist(), top_k=1, include_metadata=True)
-                prompt=result['matches'][0]['metadata']['Disease']
-                st.write(prompt)
-                prompt_template='''Accept the user’s skin condition as input and provide probable diagnoses and prescription for only that condition.    
-                Text:
-                {context}'''
-                PROMPT = PromptTemplate(
-                template=prompt_template,input_variables=["context"])
-                chain = LLMChain(llm=llm, prompt=PROMPT)
-                answer=chain.run(prompt)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
+                answer = present_image_match(result)
+                if answer:
+                    st.session_state.messages.append({"role": "assistant", "content": answer})
 
 
 flag = st.toggle("Audio")
 if not flag:
-    prompt_template='''If Medical Symptoms type yes else give politely inform the user that the data is insufficient to provide a diagnosis   
+    prompt_template='''Classify whether the text describes medical symptoms. Reply only Yes or No. This classification is not a diagnosis.
     Text:
     {context}'''
     PROMPT = PromptTemplate(
@@ -358,26 +461,54 @@ if not flag:
         st.markdown('<div class="typing">🕵️‍♂️ Skin Scout is investigating your case...</div>', unsafe_allow_html=True)
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
-        chain = LLMChain(llm=llm, prompt=PROMPT)
-        answer=chain.run(prompt)
-        if re.search(r'\bYes\b', answer):
-            prompt_template='''Accept the user’s symptoms as input and provide probable diseases, diagnoses and prescription using only the information stored in the vector database. politely inform the user that the data is insufficient to provide a diagnosis when the given prompt is not relavent to Medical Symptoms.    
-            Text:
-            {context}'''
+        red_flags = detect_emergency_red_flags(prompt)
+        if red_flags:
+            answer = (
+                "## Emergency\n"
+                "Your description contains possible emergency warning signs "
+                f"({', '.join(red_flags)}). Contact your local emergency services now. "
+                "Do not wait for an online response or use this application as a substitute "
+                "for urgent care. If you can do so safely, alert someone nearby.\n\n"
+                "This is educational information, not a diagnosis or treatment plan."
+            )
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            st.chat_message("assistant").error(answer)
+        else:
+            chain = LLMChain(llm=llm, prompt=PROMPT)
+            classification = chain.run(prompt)
+        if not red_flags and re.search(r'\bYes\b', classification, flags=re.IGNORECASE):
             PROMPT = PromptTemplate(
-                template=prompt_template, input_variables=["context"]
+                template=CLINICAL_GUIDANCE_PROMPT,
+                input_variables=["context", "question"],
             )
             retriever = VectorStoreRetriever(vectorstore=vectorstore)
             qa_chain = RetrievalQA.from_chain_type(llm=llm,
                     chain_type="stuff",
                         retriever=retriever,
+                        return_source_documents=True,
                         chain_type_kwargs={"prompt": PROMPT},)
 
-            answer = qa_chain.run(query=prompt)
+            response = qa_chain.invoke({"query": prompt})
+            answer = response["result"]
+            source_details = [
+                {
+                    "source_number": number,
+                    "metadata": source_metadata(document.metadata),
+                    "retrieved_excerpt": document.page_content[:500],
+                }
+                for number, document in enumerate(response["source_documents"], start=1)
+            ]
+            st.subheader("Retrieved evidence and source metadata")
+            st.caption(
+                "The entries below came from retrieval. The assistant response that "
+                "follows is generated guidance, not source evidence."
+            )
+            st.json(source_details)
+            st.subheader("Generated educational guidance")
             st.session_state.messages.append({"role": "assistant", "content": answer})
             st.chat_message("assistant").write(answer)
-        else:
-            prompt_template='''Accept the queries as a customer care and generate an accurate reply.   
+        elif not red_flags:
+            prompt_template='''Respond politely to the non-medical query. Do not provide a diagnosis, treatment plan, prescription, or medication advice.
                 Text:
                 {context}'''
             PROMPT = PromptTemplate(
@@ -390,7 +521,7 @@ else:
     # Set up Streamlit app layout
     st.title("Continuous Speech to Text")
     st.title("Currently still in developing phase")
-    
+
 if option == "Open Camera" and cam:
         st.chat_message("assistant").write(answer)
 if uploaded:
