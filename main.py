@@ -6,10 +6,8 @@ import json
 import base64
 import os
 import re
-from dotenv import load_dotenv,dotenv_values
 from langchain_pinecone import PineconeVectorStore
 from langchain_openai import OpenAIEmbeddings
-from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
@@ -21,6 +19,8 @@ from pinecone import Pinecone
 import openai
 import whisper
 import tempfile
+from config import AppConfig, ConfigurationError
+from retrieval import RetrievalError, retrieve_image, retrieve_text
 # --- Page Config ---
 st.set_page_config(
     page_title="MediDet-AI",
@@ -234,11 +234,14 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-config = dotenv_values("keys.env")
-os.environ['OPENAI_API_KEY'] = st.secrets["OPENAI_API_KEY"]
-os.environ['PINECONE_API_KEY'] = st.secrets["PINECONE_API_KEY"]
+try:
+    config = AppConfig.from_mapping(st.secrets)
+except ConfigurationError as exc:
+    st.error(f"Deployment configuration error: {exc}")
+    st.stop()
 
-index_name = "disease-symptoms-gpt-4"
+os.environ['OPENAI_API_KEY'] = config.openai_api_key
+os.environ['PINECONE_API_KEY'] = config.pinecone_api_key
 
 embed = OpenAIEmbeddings(
 model='text-embedding-ada-002',
@@ -249,7 +252,39 @@ llm=ChatOpenAI(api_key=os.environ['OPENAI_API_KEY'],
                    model='gpt-4o',
                    temperature=0.0)
 
-vectorstore = PineconeVectorStore(index_name=index_name, embedding=embed)
+vectorstore = PineconeVectorStore(index_name=config.text_index_name, embedding=embed)
+pc = Pinecone(api_key=config.pinecone_api_key)
+image_index = pc.Index(config.image_index_name)
+
+
+def investigate_image(image_data: Image.Image) -> None:
+    """Embed an uploaded image and render a safely retrieved assessment."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, preprocess = clip.load("ViT-B/32", device=device)
+    image_tensor = preprocess(image_data.convert("RGB")).unsqueeze(0).to(device)
+    with torch.no_grad():
+        image_features = model.encode_image(image_tensor)
+        image_features /= image_features.norm(dim=-1, keepdim=True)
+        vector = image_features.cpu().numpy().flatten().tolist()
+
+    result = retrieve_image(
+        vector,
+        image_index,
+        expected_dimension=config.image_embedding_dimension,
+    )
+    if isinstance(result, RetrievalError):
+        st.error(result.user_message)
+        return
+
+    prompt = PromptTemplate(
+        template="""Accept the user's skin condition as input and provide probable diagnoses and prescription for only that condition.
+        Text:
+        {context}""",
+        input_variables=["context"],
+    )
+    answer = (prompt | llm).invoke({"context": result.value}).content
+    st.session_state.messages.append({"role": "assistant", "content": answer})
+    st.chat_message("assistant").write(answer)
 
 if "messages" not in st.session_state:
     st.session_state["messages"] = [{"role": "assistant", "content": "Hello! MediDet AI is here to help you diagnose symptoms. How can I assist you today?"
@@ -283,32 +318,7 @@ with st.sidebar:
         if uploaded:
             image = Image.open(uploaded)
             st.image(image, caption="📁 Exhibit A", use_column_width=True)
-            image_data = image
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            model, preprocess = clip.load("ViT-B/32", device=device)
-            image = image_data.convert("RGB")
-            image_tensor = preprocess(image).unsqueeze(0).to(device)
-            with torch.no_grad():
-                image_features = model.encode_image(image_tensor)
-                image_features /= image_features.norm(dim=-1, keepdim=True)
-                vector = image_features.cpu().numpy().flatten()
-                st.success("✅ Image converted to CLIP vector!")
-                st.write("Vector (first 10 values):", vector.shape)
-                index_name = "skindisease-symptoms-gpt-4"
-                pc = Pinecone(api_key=os.environ['PINECONE_API_KEY'])
-                index = pc.Index(index_name)
-                rv=vector.reshape(1, -1)
-                result= index.query(vector=rv.flatten().tolist(), top_k=1, include_metadata=True)
-                prompt=result['matches'][0]['metadata']['Disease']
-                st.write(prompt)
-                prompt_template='''Accept the user’s skin condition as input and provide probable diagnoses and prescription for only that condition.    
-                Text:
-                {context}'''
-                PROMPT = PromptTemplate(
-                template=prompt_template,input_variables=["context"])
-                chain = PROMPT | llm
-                answer=chain.invoke({"context": prompt}).content
-                st.session_state.messages.append({"role": "assistant", "content": answer})
+            investigate_image(image)
 
     elif option == "Open Camera":
         
@@ -316,32 +326,7 @@ with st.sidebar:
         if cam:
             image = Image.open(cam)
             st.image(image, caption="📸 Snapshot captured!", use_column_width=True)
-            image_data = image
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            model, preprocess = clip.load("ViT-B/32", device=device)
-            image = image_data.convert("RGB")
-            image_tensor = preprocess(image).unsqueeze(0).to(device)
-            with torch.no_grad():
-                image_features = model.encode_image(image_tensor)
-                image_features /= image_features.norm(dim=-1, keepdim=True)
-                vector = image_features.cpu().numpy().flatten()
-                st.success("✅ Image converted to CLIP vector!")
-                st.write("Vector (first 10 values):", vector.shape)
-                index_name = "skindisease-symptoms-gpt-4"
-                pc = Pinecone(api_key=os.environ['PINECONE_API_KEY'])
-                index = pc.Index(index_name)
-                rv=vector.reshape(1, -1)
-                result= index.query(vector=rv.flatten().tolist(), top_k=1, include_metadata=True)
-                prompt=result['matches'][0]['metadata']['Disease']
-                st.write(prompt)
-                prompt_template='''Accept the user’s skin condition as input and provide probable diagnoses and prescription for only that condition.    
-                Text:
-                {context}'''
-                PROMPT = PromptTemplate(
-                template=prompt_template,input_variables=["context"])
-                chain = PROMPT | llm
-                answer=chain.invoke({"context": prompt}).content
-                st.session_state.messages.append({"role": "assistant", "content": answer})
+            investigate_image(image)
 
 
 flag = st.toggle("Audio")
@@ -369,11 +354,14 @@ if not flag:
                 template=prompt_template, input_variables=["context", "input"]
             )
             document_chain = create_stuff_documents_chain(llm, PROMPT)
-            qa_chain = create_retrieval_chain(
-                vectorstore.as_retriever(), document_chain
-            )
-
-            answer = qa_chain.invoke({"input": prompt})["answer"]
+            retrieval = retrieve_text(prompt, vectorstore)
+            if isinstance(retrieval, RetrievalError):
+                st.error(retrieval.user_message)
+                answer = retrieval.user_message
+            else:
+                answer = document_chain.invoke(
+                    {"input": prompt, "context": retrieval.value}
+                )
             st.session_state.messages.append({"role": "assistant", "content": answer})
             st.chat_message("assistant").write(answer)
         else:
@@ -392,11 +380,7 @@ else:
     st.title("Continuous Speech to Text")
     st.title("Currently still in developing phase")
     
-if option == "Open Camera" and cam:
-        st.chat_message("assistant").write(answer)
-if uploaded:
-        st.chat_message("assistant").write(answer)
 if st.button('clear'):
-    h.update_one({"id": 'krrish'},{"$set": {"text": ""}})
+    st.session_state.messages = []
 
 
