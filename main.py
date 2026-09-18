@@ -6,7 +6,6 @@ import json
 import base64
 import os
 import re
-from dotenv import load_dotenv,dotenv_values
 from langchain_pinecone import PineconeVectorStore
 from langchain_openai import OpenAIEmbeddings
 from langchain.chains import create_retrieval_chain
@@ -241,14 +240,45 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-config = dotenv_values("keys.env")
-os.environ['OPENAI_API_KEY'] = st.secrets["OPENAI_API_KEY"]
-os.environ['PINECONE_API_KEY'] = st.secrets["PINECONE_API_KEY"]
+def load_configuration():
+    required_keys = (
+        "OPENAI_API_KEY",
+        "PINECONE_API_KEY",
+        "TEXT_INDEX_NAME",
+        "IMAGE_INDEX_NAME",
+    )
+    values = {}
 
-index_name = "disease-symptoms-gpt-4"
+    for key in required_keys:
+        try:
+            secret_value = st.secrets.get(key)
+        except Exception:
+            # Streamlit raises when no secrets file exists during local development.
+            secret_value = None
+
+        value = secret_value or os.getenv(key)
+        if value and str(value).strip():
+            values[key] = str(value).strip()
+
+    missing_keys = [key for key in required_keys if key not in values]
+    if missing_keys:
+        st.error(f"Configuration error: missing {', '.join(missing_keys)}.")
+        st.stop()
+
+    return tuple(values[key] for key in required_keys)
+
+
+openai_api_key, pinecone_api_key, text_index_name, image_index_name = load_configuration()
+os.environ["OPENAI_API_KEY"] = openai_api_key
+os.environ["PINECONE_API_KEY"] = pinecone_api_key
 
 embed = OpenAIEmbeddings(
 model='text-embedding-ada-002',
+openai_api_key=openai_api_key
+)
+
+llm=ChatOpenAI(api_key=openai_api_key,
+                   model_name='gpt-4o',
 api_key=os.environ['OPENAI_API_KEY']
 )
 
@@ -256,7 +286,7 @@ llm=ChatOpenAI(api_key=os.environ['OPENAI_API_KEY'],
                    model='gpt-4o',
                    temperature=0.0)
 
-vectorstore = PineconeVectorStore(index_name=index_name, embedding=embed)
+vectorstore = PineconeVectorStore(index_name=text_index_name, embedding=embed)
 
 
 def analyze_image(image_bytes: bytes) -> str:
@@ -330,9 +360,8 @@ with st.sidebar:
                 vector = image_features.cpu().numpy().flatten()
                 st.success("✅ Image converted to CLIP vector!")
                 st.write("Vector (first 10 values):", vector.shape)
-                index_name = "skindisease-symptoms-gpt-4"
-                pc = Pinecone(api_key=os.environ['PINECONE_API_KEY'])
-                index = pc.Index(index_name)
+                pc = Pinecone(api_key=pinecone_api_key)
+                index = pc.Index(image_index_name)
                 rv=vector.reshape(1, -1)
                 result= index.query(vector=rv.flatten().tolist(), top_k=1, include_metadata=True)
                 prompt=result['matches'][0]['metadata']['Disease']
@@ -363,9 +392,8 @@ with st.sidebar:
                 vector = image_features.cpu().numpy().flatten()
                 st.success("✅ Image converted to CLIP vector!")
                 st.write("Vector (first 10 values):", vector.shape)
-                index_name = "skindisease-symptoms-gpt-4"
-                pc = Pinecone(api_key=os.environ['PINECONE_API_KEY'])
-                index = pc.Index(index_name)
+                pc = Pinecone(api_key=pinecone_api_key)
+                index = pc.Index(image_index_name)
                 rv=vector.reshape(1, -1)
                 result= index.query(vector=rv.flatten().tolist(), top_k=1, include_metadata=True)
                 prompt=result['matches'][0]['metadata']['Disease']
