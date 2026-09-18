@@ -1,16 +1,14 @@
 streamlit==1.44.1
 streamlit-lottie==0.0.5
-python-dotenv==1.1.0
-langchain==0.3.23
-langchain-core==0.3.51
-langchain-openai==0.3.12
-langchain-pinecone==0.2.3
-openai==1.70.0
-pinecone==5.4.2
-pandas==2.2.3
-pydub==0.25.1
-git+https://github.com/openai/CLIP.git@a9b1bf5920416aaeaec965c25dd9e8f98c864f16
-openai-whisper==20240930
-torch==2.6.0
-SpeechRecognition==3.14.2
+python-dotenv
+langchain-pinecone
+langchain-openai
+langchain-core
+langchain
+pandas
+pydub
+clip @ git+https://github.com/openai/CLIP.git@dcba3cb2e2827b402d2701e7e1c7d9fed8a20ef1
+git+https://github.com/openai/whisper.git
+torch
+SpeechRecognition
 pip==25.0
