@@ -21,6 +21,7 @@ from pinecone import Pinecone
 import openai
 import whisper
 import tempfile
+import hashlib
 # --- Page Config ---
 st.set_page_config(
     page_title="MediDet-AI",
@@ -256,6 +257,34 @@ llm=ChatOpenAI(api_key=os.environ['OPENAI_API_KEY'],
                    temperature=0.0)
 
 vectorstore = PineconeVectorStore(index_name=index_name, embedding=embed)
+
+
+def analyze_image(image_bytes: bytes) -> str:
+    """Analyze an image and return a diagnosis without mutating chat history."""
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, preprocess = clip.load("ViT-B/32", device=device)
+    image_tensor = preprocess(image).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        image_features = model.encode_image(image_tensor)
+        image_features /= image_features.norm(dim=-1, keepdim=True)
+
+    vector = image_features.cpu().numpy().flatten()
+    pc = Pinecone(api_key=os.environ['PINECONE_API_KEY'])
+    index = pc.Index("skindisease-symptoms-gpt-4")
+    result = index.query(
+        vector=vector.reshape(1, -1).tolist(),
+        top_k=1,
+        include_metadata=True,
+    )
+    condition = result['matches'][0]['metadata']['Disease']
+    prompt_template = '''Accept the user’s skin condition as input and provide probable diagnoses and prescription for only that condition.
+    Text:
+    {context}'''
+    prompt = PromptTemplate(template=prompt_template, input_variables=["context"])
+    chain = LLMChain(llm=llm, prompt=prompt)
+    return chain.run(condition)
 
 if "messages" not in st.session_state:
     st.session_state["messages"] = [
