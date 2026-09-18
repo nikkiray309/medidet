@@ -18,7 +18,7 @@ We designed it so people do not need to be tech-savvy or medically trained. Whet
 Implementation
 
 ## Technologies
-Streamlit, OpenAI (CLIP, GPT-4, Whisper), LangChain, Pinecone, MongoDB Methods: Retrieval-Augmented Generation (RAG), Speech-to-text (Whisper), Image embeddings (CLIP), LLM-based reasoning (GPT-4) Datasets: Custom disease-symptom metadata in Pinecone, user queries stored in MongoDB
+Streamlit, OpenAI (CLIP, GPT-4, Whisper), LangChain, and Pinecone. Methods: Retrieval-Augmented Generation (RAG), speech-to-text (Whisper), image embeddings (CLIP), and LLM-based reasoning (GPT-4). Disease-symptom metadata is stored in Pinecone, while conversation and image-result state is kept only in the current Streamlit session.
 
 
 ## Results & Demo
@@ -29,7 +29,7 @@ Streamlit, OpenAI (CLIP, GPT-4, Whisper), LangChain, Pinecone, MongoDB Methods: 
 
 · Dynamic suggestions powered by GPT-4 using disease-specific prompt templates.
 
-· Integration with MongoDB for storing and updating user data and session history.
+· Session-scoped conversation history that can be cleared without persisting health queries to an external database.
 
 · Accurate matches from a vector database of skin disease profiles.
 
