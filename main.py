@@ -11,6 +11,10 @@ from langchain_openai import OpenAIEmbeddings
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_openai import ChatOpenAI
+from langchain.prompts import PromptTemplate
+import torch
+import clip
+from pinecone import Pinecone
 from langchain_core.prompts import PromptTemplate
 import io
 import speech_recognition as sr
@@ -156,6 +160,120 @@ st.set_page_config(
     layout="wide",
 )
 
+uploaded = None
+cam = None
+answer = None
+
+
+@st.cache_resource
+def create_embeddings(openai_api_key: str):
+    """Create the shared, immutable OpenAI embedding client."""
+    return OpenAIEmbeddings(
+        model="text-embedding-ada-002",
+        openai_api_key=openai_api_key,
+    )
+
+
+@st.cache_resource
+def create_chat_model(openai_api_key: str):
+    """Create the shared, immutable chat model client."""
+    return ChatOpenAI(
+        api_key=openai_api_key,
+        model_name="gpt-4o",
+        temperature=0.0,
+    )
+
+
+@st.cache_resource
+def create_pinecone_client(pinecone_api_key: str):
+    """Create a shared Pinecone client without caching query results."""
+    return Pinecone(api_key=pinecone_api_key)
+
+
+@st.cache_resource
+def create_vector_store(index_name: str, _embeddings, pinecone_api_key: str):
+    """Create the shared vector-store connection."""
+    # The API key participates in the cache key; the SDK reads it from the environment.
+    return PineconeVectorStore(index_name=index_name, embedding=_embeddings)
+
+
+@st.cache_resource
+def create_clip_model():
+    """Load CLIP on first image analysis and reuse only the model resources."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, preprocess = clip.load("ViT-B/32", device=device)
+    model.eval()
+    return model, preprocess, device
+
+
+def load_clip_for_analysis():
+    """Load CLIP with user feedback, returning None when loading is unsafe."""
+    try:
+        with st.spinner("Loading the image-analysis model…"):
+            return create_clip_model()
+    except (MemoryError, RuntimeError):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        st.error(
+            "The image-analysis model could not be loaded with the available "
+            "memory. You can continue using symptom chat or try the image again."
+        )
+        return None
+    except Exception:
+        st.error(
+            "Image analysis is temporarily unavailable because the model failed "
+            "to load. You can continue using symptom chat and retry later."
+        )
+        return None
+
+
+def analyze_image(image_data, llm, pinecone_api_key: str):
+    """Analyze one uploaded image; all request-specific values stay local."""
+    clip_resources = load_clip_for_analysis()
+    if clip_resources is None:
+        return None
+
+    model, preprocess, device = clip_resources
+    try:
+        image_tensor = preprocess(image_data.convert("RGB")).unsqueeze(0).to(device)
+        with torch.no_grad():
+            image_features = model.encode_image(image_tensor)
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+
+        vector = image_features.cpu().numpy().flatten()
+        st.success("✅ Image converted to CLIP vector!")
+        st.write("Vector shape:", vector.shape)
+
+        index = create_pinecone_client(pinecone_api_key).Index(
+            "skindisease-symptoms-gpt-4"
+        )
+        result = index.query(
+            vector=vector.reshape(1, -1).tolist(),
+            top_k=1,
+            include_metadata=True,
+        )
+        disease = result["matches"][0]["metadata"]["Disease"]
+        st.write(disease)
+        prompt = PromptTemplate(
+            template=(
+                "Accept the user’s skin condition as input and provide probable "
+                "diagnoses and prescription for only that condition.\nText:\n{context}"
+            ),
+            input_variables=["context"],
+        )
+        answer = LLMChain(llm=llm, prompt=prompt).run(disease)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        return answer
+    except (MemoryError, RuntimeError):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        st.error(
+            "There was not enough memory to analyze this image. Try a smaller "
+            "image, switch to symptom chat, or retry later."
+        )
+    except Exception:
+        st.error("Image analysis failed. You can retry without restarting the app.")
+    return None
 INITIAL_ASSISTANT_GREETING = (
     "Hello! MediDet AI is here to help you diagnose symptoms. "
     "How can I assist you today?"
@@ -368,6 +486,10 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+openai_api_key = st.secrets["OPENAI_API_KEY"]
+pinecone_api_key = st.secrets["PINECONE_API_KEY"]
+os.environ["OPENAI_API_KEY"] = openai_api_key
+os.environ["PINECONE_API_KEY"] = pinecone_api_key
 def load_configuration():
     required_keys = (
         "OPENAI_API_KEY",
@@ -400,6 +522,9 @@ openai_api_key, pinecone_api_key, text_index_name, image_index_name = load_confi
 os.environ["OPENAI_API_KEY"] = openai_api_key
 os.environ["PINECONE_API_KEY"] = pinecone_api_key
 
+embeddings = create_embeddings(openai_api_key)
+llm = create_chat_model(openai_api_key)
+vectorstore = create_vector_store(index_name, embeddings, pinecone_api_key)
 embed = OpenAIEmbeddings(
 model='text-embedding-ada-002',
 openai_api_key=openai_api_key
@@ -495,6 +620,7 @@ with st.sidebar:
         if uploaded:
             image = Image.open(uploaded)
             st.image(image, caption="📁 Exhibit A", use_column_width=True)
+            answer = analyze_image(image, llm, pinecone_api_key)
             image_data = image
             device = "cuda" if torch.cuda.is_available() else "cpu"
             model, preprocess = clip.load("ViT-B/32", device=device)
@@ -527,6 +653,7 @@ with st.sidebar:
         if cam:
             image = Image.open(cam)
             st.image(image, caption="📸 Snapshot captured!", use_column_width=True)
+            answer = analyze_image(image, llm, pinecone_api_key)
             image_data = image
             device = "cuda" if torch.cuda.is_available() else "cpu"
             model, preprocess = clip.load("ViT-B/32", device=device)
@@ -602,14 +729,17 @@ else:
     st.title("Continuous Speech to Text")
     st.title("Currently still in developing phase")
     
+if option == "Open Camera" and cam and answer:
 if image_answer:
         st.chat_message("assistant").write(image_answer)
 if st.button('clear'):
     h.update_one({"id": 'krrish'},{"$set": {"text": ""}})
 if option == "Open Camera" and cam:
         st.chat_message("assistant").write(answer)
-if uploaded:
+if uploaded and answer:
         st.chat_message("assistant").write(answer)
+if st.button('clear'):
+    st.session_state.messages = []
 if st.button("clear"):
     st.session_state["messages"] = [
         {"role": "assistant", "content": INITIAL_ASSISTANT_GREETING}
