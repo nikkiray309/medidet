@@ -283,10 +283,92 @@ IMAGE_RESULT_STATE_KEYS = ("image_data", "image_result")
 global uploaded
 uploaded=False
 
+MEDICAL_DISCLAIMER = """
+**Medical disclaimer:** MediDet-AI provides general educational information only. It
+does not provide a diagnosis, treatment plan, or prescription and is not a substitute
+for care from a qualified health professional. Images and AI-generated text can be
+incomplete or wrong. If you may be experiencing a medical emergency, contact your
+local emergency services now. Seek professional evaluation for symptoms that are
+serious, worsening, or persistent.
+"""
+
+RED_FLAG_PATTERNS = {
+    "difficulty breathing": r"\b(can'?t breathe|cannot breathe|difficulty breathing|shortness of breath|choking)\b",
+    "chest pain": r"\b(chest pain|chest pressure|crushing chest)\b",
+    "possible stroke": r"\b(face droop|facial droop|slurred speech|one[- ]sided weakness|sudden weakness)\b",
+    "severe allergic reaction": r"\b(anaphylaxis|throat (?:is )?closing|swollen tongue|tongue swelling)\b",
+    "loss of consciousness": r"\b(unconscious|passed out|loss of consciousness|not waking)\b",
+    "severe bleeding": r"\b(severe bleeding|bleeding (?:won't|will not) stop|hemorrhag)\b",
+    "suicide or self-harm risk": r"\b(kill myself|suicid(?:e|al)|self[- ]harm|hurt myself)\b",
+}
+
+
+def detect_emergency_red_flags(text):
+    """Return educational red-flag labels found in user-provided text."""
+    normalized_text = text or ""
+    return [
+        label
+        for label, pattern in RED_FLAG_PATTERNS.items()
+        if re.search(pattern, normalized_text, flags=re.IGNORECASE)
+    ]
+
+
+def source_metadata(metadata):
+    """Keep source provenance visible without treating it as generated guidance."""
+    return metadata or {"metadata": "No source metadata was supplied."}
+
+
+CLINICAL_GUIDANCE_PROMPT = """
+You are providing cautious, general health education, not medical care.
+
+RETRIEVED EVIDENCE:
+{context}
+
+USER'S DESCRIPTION:
+{question}
+
+Rules:
+- Never state or imply a definitive diagnosis. Present a short list of possible
+  explanations using uncertainty language (for example, "could," "may," or
+  "one possibility") and explain that an in-person assessment may differ.
+- Do not prescribe, recommend, name, dose, start, stop, or change medication.
+- Clearly label separate sections "Retrieved evidence" and "Generated educational
+  guidance." Do not represent generated statements as retrieved facts.
+- Mention important limitations and useful questions a clinician may ask.
+- If the description suggests emergency warning signs (including trouble breathing,
+  chest pain, stroke signs, anaphylaxis, loss of consciousness, severe bleeding, or
+  imminent self-harm), begin with an "Emergency" section instructing the user to
+  contact local emergency services now. Do not delay that instruction with analysis.
+- Advise evaluation by an appropriately qualified health professional for serious,
+  worsening, or persistent symptoms. Do not give false reassurance.
+- If evidence is insufficient or unrelated, say so plainly rather than guessing.
+- End with: "This is educational information, not a diagnosis or treatment plan."
+"""
+
+IMAGE_GUIDANCE_PROMPT = """
+You are providing cautious, general educational information about an image match.
+
+RETRIEVED IMAGE-MATCH EVIDENCE AND METADATA:
+{context}
+
+Rules:
+- An image similarity match is not a diagnosis. Never claim a definitive diagnosis.
+- Present possible explanations only as uncertain educational information.
+- Do not prescribe, recommend, name, dose, start, stop, or change medication.
+- Clearly separate "Retrieved evidence" from "Generated educational guidance," and
+  identify the retrieved item as a similarity result rather than a clinical finding.
+- Explain image-only limitations and advise professional evaluation, especially for
+  serious, rapidly changing, painful, infected-looking, or persistent skin symptoms.
+- Tell the user to contact local emergency services now for emergency warning signs
+  such as trouble breathing, facial/throat swelling, fainting, or a rapidly spreading
+  severe reaction.
+- End with: "This is educational information, not a diagnosis or treatment plan."
+"""
+
 def load_lottie_url(path: str):
     with open(path, "r") as file:
         return json.load(file)
-    
+
 # Path to your det.json animation
 lottie_animation = load_lottie_url("assets/detwalking.json")
 
@@ -569,6 +651,27 @@ def analyze_image(image_bytes: bytes) -> str:
     chain = LLMChain(llm=llm, prompt=prompt)
     return chain.run(condition)
 
+
+def present_image_match(result):
+    """Expose image-match evidence, then generate separately labelled guidance."""
+    matches = result.get("matches", [])
+    if not matches:
+        st.warning("No image-match evidence was retrieved; no guidance was generated.")
+        return None
+
+    match = matches[0]
+    evidence = {
+        "match_id": match.get("id"),
+        "similarity_score": match.get("score"),
+        "metadata": source_metadata(match.get("metadata")),
+    }
+    st.subheader("Retrieved source metadata")
+    st.json(evidence)
+
+    prompt = PromptTemplate(template=IMAGE_GUIDANCE_PROMPT, input_variables=["context"])
+    answer = LLMChain(llm=llm, prompt=prompt).run(json.dumps(evidence, default=str))
+    return answer
+
 if "messages" not in st.session_state:
     st.session_state["messages"] = [
         {"role": "assistant", "content": INITIAL_ASSISTANT_GREETING}
@@ -648,7 +751,7 @@ with st.sidebar:
                 st.session_state.messages.append({"role": "assistant", "content": answer})
 
     elif option == "Open Camera":
-        
+
         cam = st.camera_input("Live Surveillance")
         if cam:
             image = Image.open(cam)
@@ -683,7 +786,7 @@ with st.sidebar:
 
 flag = st.toggle("Audio")
 if not flag:
-    prompt_template='''If Medical Symptoms type yes else give politely inform the user that the data is insufficient to provide a diagnosis   
+    prompt_template='''Classify whether the text describes medical symptoms. Reply only Yes or No. This classification is not a diagnosis.
     Text:
     {context}'''
     PROMPT = PromptTemplate(
@@ -713,8 +816,8 @@ if not flag:
             answer = qa_chain.invoke({"input": prompt})["answer"]
             st.session_state.messages.append({"role": "assistant", "content": answer})
             st.chat_message("assistant").write(answer)
-        else:
-            prompt_template='''Accept the queries as a customer care and generate an accurate reply.   
+        elif not red_flags:
+            prompt_template='''Respond politely to the non-medical query. Do not provide a diagnosis, treatment plan, prescription, or medication advice.
                 Text:
                 {context}'''
             PROMPT = PromptTemplate(
