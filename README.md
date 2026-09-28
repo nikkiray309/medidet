@@ -1,93 +1,56 @@
-# MediDet-AI
+### GradInno Hackathon 2025 - Final project
 
-MediDet-AI is a Streamlit proof of concept for retrieval-assisted symptom chat and
-image-similarity lookup. It was created for the GradInno Hackathon 2025.
+# MediDet-AI : A Multi-modal RAG Application
+MediDet-AI is an innovative, tech-forward healthcare assistant application designed to empower users to monitor their general health, with a specialized feature for skin disease detection.
+## Problem Statement
 
-> **Medical disclaimer:** This prototype can produce incorrect or incomplete
-> output. It is not a medical device, does not establish a diagnosis, and is not a
-> substitute for a qualified clinician or emergency services.
+Despite the growing availability of digital health tools, there remains a significant gap in early detection and personalized care for health conditions, particularly in underserved communities. Skin diseases often go unnoticed due to the lack of dermatological expertise, while other medical symptoms are frequently misunderstood or poorly communicated. Existing platforms often require users to rely on a single mode of input, limiting their accessibility and accuracy.
 
-## Implemented behavior
+There is a pressing need for an intelligent, inclusive solution that supports image-based diagnosis for skin conditions and text/audio-based symptom analysis for general health concerns. This would empower users to receive real-time, AI-driven insights, irrespective of their medical literacy or geographic location.
 
-- Accepts typed chat messages and uses an LLM to classify them as symptom-related
-  or general inquiries.
-- Retrieves context for symptom-related messages from a Pinecone text index and
-  gives the retrieved documents to GPT-4o through a LangChain retrieval chain.
-- Accepts a JPG or PNG from file upload or Streamlit's camera widget, embeds the
-  image with CLIP ViT-B/32, and finds the closest disease record in a separate
-  Pinecone index before asking GPT-4o to describe that condition.
-- Keeps chat messages in Streamlit session state for the current browser session.
+## Proposal
 
-The **Audio** toggle only displays a development notice. Audio capture,
-speech-to-text, multilingual support, persistent user accounts, and persistent
-chat history are not implemented. The application does not use MongoDB.
+MediDetAI is built to make health support feel simple, smart, and accessible. If someone has a rash, acne, or any visible skin issue, they can just snap a picture—and MediDetAI will help identify what it might be. But it does not stop there. If they are feeling unwell or confused about symptoms that are not visible, they can either type them in or say them aloud. MediDetAI listens, understands, and responds with helpful insights based on medical knowledge.
 
-## Planned behavior
+This uses Agentic AI and Implements multimodal RAG. In the text session one agent classifies whether the given text is related to the medical field or general question. For general question another agent response as the normal customer care prompt. When a medical symptomis asked by the user as a query the RAG agent triggers and responds with semantic search. The same thing goes with audio input but first the whisper agent converts the audio input to text. The image input just uses similarity search and there is a future scope in it where we want add some extra features to it.
 
-- Implement audio capture and speech-to-text.
-- Add multilingual input and output.
-- Improve image data and labels, broaden skin-condition coverage, and reject
-  images that are unsuitable for skin-condition matching.
-- Add appropriate evaluation, safety controls, and clinician review before any
-  use beyond a demonstration.
+We designed it so people do not need to be tech-savvy or medically trained. Whether it is through a photo of a skin condition, a voice note, or a few words typed in, MediDetAI uses AI to break down what might be going on and what to do next—whether it is offering precautions, home remedies, or guidance to seek care. It is like having a friendly health assistant always ready to listen and help, right in your pocket.
+Implementation
 
-## Configuration
+## Technologies
+Streamlit, OpenAI (CLIP, GPT-4, Whisper), LangChain, and Pinecone. Methods: Retrieval-Augmented Generation (RAG), speech-to-text (Whisper), image embeddings (CLIP), and LLM-based reasoning (GPT-4). Disease-symptom metadata is stored in Pinecone, while conversation and image-result state is kept only in the current Streamlit session.
 
-### Streamlit secrets
 
-Create `.streamlit/secrets.toml` locally (do not commit it):
+## Results & Demo
 
-```toml
-OPENAI_API_KEY = "your-openai-api-key"
-PINECONE_API_KEY = "your-pinecone-api-key"
-```
+· The app supports multimodal interaction – images (via upload or webcam), voice (converted to text), and typed symptoms.
 
-Both values are required at application startup. A `keys.env` or `.env` file is
-not read by the application.
+· Uses CLIP for skin condition embedding and Pinecone for fast similarity search.
 
-### Pinecone indexes
+· Dynamic suggestions powered by GPT-4 using disease-specific prompt templates.
 
-The configured Pinecone project must contain these indexes before startup:
+· Session-scoped conversation history that can be cleared without persisting health queries to an external database.
 
-| Index | Purpose | Embedding model | Dimensions | Required metadata |
-| --- | --- | --- | ---: | --- |
-| `disease-symptoms-gpt-4` | Symptom-document retrieval | OpenAI `text-embedding-ada-002` | 1536 | Text records compatible with LangChain's Pinecone vector store |
-| `skindisease-symptoms-gpt-4` | Skin-image similarity | OpenAI CLIP `ViT-B/32` image encoder | 512 | `Disease` string on every match |
+· Accurate matches from a vector database of skin disease profiles.
 
-Index dimensions must exactly match their embedding vectors. This repository does
-not include index creation or data-ingestion scripts, so operators must provision
-and populate both indexes separately. The index metric should be selected to match
-the normalization and ingestion process used for the stored vectors.
 
-## Run locally
 
-Python 3.10 or 3.11 is recommended. CLIP and PyTorch make the installation large;
-the first image request may also download CLIP model weights.
+## Impact
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-mkdir -p .streamlit
-# Create .streamlit/secrets.toml as shown above.
-streamlit run main.py
-```
+Societal Benefits:
 
-Open the local URL printed by Streamlit, normally `http://localhost:8501`.
+· Early diagnosis of common skin conditions, preventing serious complications.
 
-## Deployment limitations
+· Voice input and multilingual support improve accessibility for non-tech-savvy users.
 
-- A deployment needs outbound network access to OpenAI, Pinecone, Google Fonts,
-  the background image host, and (on first use) the CLIP model-weight host.
-- The pinned PyTorch and Git-installed CLIP dependencies produce a large build and
-  may exceed memory, image-size, or build-time limits on small hosting tiers.
-- Image inference uses CPU unless CUDA is available and can be slow. The CLIP model
-  is cached only within one running application process.
-- Streamlit session state is ephemeral and isolated per session; restarting or
-  scaling the application loses chat state.
-- Secrets must be configured in the hosting provider's Streamlit secrets facility,
-  and both Pinecone indexes must be provisioned independently.
-- Camera capture depends on browser permission and a secure context when deployed.
-- There is no authentication, durable storage, rate limiting, automated index
-  provisioning, medical validation, or production safety monitoring.
+· Helpful for remote and underserved populations.
+
+Next Steps:
+
+· Add Support for more languages and disease categories.
+
+· Improve the Image data and labels for RAG.
+
+· Add an agent to detect whether the given image is a Human Face or not.
+
+· And able to address many skin diseases.
