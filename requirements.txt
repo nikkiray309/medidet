@@ -7,9 +7,8 @@ langchain-core
 langchain
 pandas
 pydub
-git+https://github.com/openai/CLIP.git
+clip @ git+https://github.com/openai/CLIP.git@dcba3cb2e2827b402d2701e7e1c7d9fed8a20ef1
 git+https://github.com/openai/whisper.git
 torch
-clip
 SpeechRecognition
 pip==25.0

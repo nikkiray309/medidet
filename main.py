@@ -1,19 +1,21 @@
 import streamlit as st
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 import random
 from streamlit_lottie import st_lottie
 import json
 import base64
 import os
 import re
-from dotenv import load_dotenv,dotenv_values
 from langchain_pinecone import PineconeVectorStore
 from langchain_openai import OpenAIEmbeddings
-from langchain_core.vectorstores import VectorStoreRetriever
-from langchain.chains import RetrievalQA
-from langchain.chains import LLMChain
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
+import torch
+import clip
+from pinecone import Pinecone
+from langchain_core.prompts import PromptTemplate
 import io
 import speech_recognition as sr
 import torch
@@ -22,12 +24,261 @@ from pinecone import Pinecone
 import openai
 import whisper
 import tempfile
+import math
+from collections.abc import Mapping
+from numbers import Real
+
+SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png"}
+SUPPORTED_IMAGE_FORMATS = {"JPEG", "PNG"}
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_PIXELS = 25_000_000
+DEFAULT_CLIP_SIMILARITY_THRESHOLD = 0.80
+UNABLE_TO_CLASSIFY = (
+    "Unable to classify this image reliably. Please try a clear, well-lit JPEG or "
+    "PNG image, or consult a qualified healthcare professional."
+)
+
+
+def get_clip_similarity_threshold():
+    """Return a validated cosine-similarity cutoff for normalized CLIP vectors.
+
+    0.80 is a conservative initial cutoff for this index and should be re-calibrated
+    against a labelled validation set whenever the index contents or model change.
+    """
+    raw_threshold = os.getenv(
+        "CLIP_SIMILARITY_THRESHOLD", str(DEFAULT_CLIP_SIMILARITY_THRESHOLD)
+    )
+    try:
+        threshold = float(raw_threshold)
+    except (TypeError, ValueError):
+        return DEFAULT_CLIP_SIMILARITY_THRESHOLD
+    # The Pinecone index uses cosine similarity for normalized CLIP embeddings.
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        return DEFAULT_CLIP_SIMILARITY_THRESHOLD
+    return threshold
+
+
+def decode_supported_image(image_file):
+    """Validate the upload and fully decode it before it reaches CLIP."""
+    content_type = getattr(image_file, "type", None)
+    if content_type not in SUPPORTED_IMAGE_TYPES:
+        raise ValueError("unsupported image content type")
+
+    image_bytes = image_file.getvalue()
+    if not image_bytes or len(image_bytes) > MAX_IMAGE_BYTES:
+        raise ValueError("invalid image size")
+
+    with Image.open(io.BytesIO(image_bytes)) as candidate:
+        if candidate.format not in SUPPORTED_IMAGE_FORMATS:
+            raise ValueError("unsupported decoded image format")
+        width, height = candidate.size
+        if width < 1 or height < 1 or width * height > MAX_IMAGE_PIXELS:
+            raise ValueError("invalid image dimensions")
+        candidate.verify()
+
+    # verify() invalidates the decoder, so reopen and force a complete decode.
+    with Image.open(io.BytesIO(image_bytes)) as decoded:
+        decoded.load()
+        return decoded.convert("RGB")
+
+
+def match_value(value, key):
+    if isinstance(value, Mapping):
+        return value.get(key)
+    return getattr(value, key, None)
+
+
+def validated_disease_match(result, threshold):
+    """Return a disease only for a complete, sufficiently similar match."""
+    matches = match_value(result, "matches")
+    if not isinstance(matches, (list, tuple)) or not matches:
+        return None
+
+    match = matches[0]
+    metadata = match_value(match, "metadata")
+    if not isinstance(metadata, Mapping):
+        return None
+    disease = metadata.get("Disease")
+    score = match_value(match, "score")
+    if not isinstance(disease, str) or not disease.strip():
+        return None
+    if isinstance(score, bool) or not isinstance(score, Real):
+        return None
+    if not math.isfinite(score) or not -1.0 <= score <= 1.0 or score < threshold:
+        return None
+    return disease.strip()
+
+
+def analyze_skin_image(image_file, llm):
+    """Run the shared upload/camera analysis path with stage-specific failures."""
+    try:
+        image = decode_supported_image(image_file)
+    except (ValueError, UnidentifiedImageError, OSError, Image.DecompressionBombError):
+        return None, UNABLE_TO_CLASSIFY
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        model, preprocess = clip.load("ViT-B/32", device=device)
+        image_tensor = preprocess(image).unsqueeze(0).to(device)
+        with torch.no_grad():
+            image_features = model.encode_image(image_tensor)
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+            if not torch.isfinite(image_features).all():
+                raise ValueError("CLIP produced a non-finite embedding")
+            vector = image_features.cpu().numpy().flatten()
+    except (RuntimeError, OSError, ValueError, TypeError):
+        return image, UNABLE_TO_CLASSIFY
+
+    try:
+        pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+        index = pc.Index("skindisease-symptoms-gpt-4")
+        result = index.query(
+            vector=vector.reshape(1, -1).tolist(), top_k=1, include_metadata=True
+        )
+    except Exception:  # SDK transports expose several provider-specific exceptions.
+        return image, UNABLE_TO_CLASSIFY
+
+    disease = validated_disease_match(result, get_clip_similarity_threshold())
+    if disease is None:
+        return image, UNABLE_TO_CLASSIFY
+
+    prompt_template = """Accept the user’s skin condition as input and provide probable diagnoses and prescription for only that condition.
+    Text:
+    {context}"""
+    try:
+        prompt = PromptTemplate(template=prompt_template, input_variables=["context"])
+        answer = LLMChain(llm=llm, prompt=prompt).run(disease)
+    except Exception:  # LangChain/provider failures must not leak request details.
+        return image, UNABLE_TO_CLASSIFY
+    return image, answer
+import tempfile
+import hashlib
 # --- Page Config ---
 st.set_page_config(
     page_title="MediDet-AI",
     page_icon="🕵️‍♂️",
     layout="wide",
 )
+
+uploaded = None
+cam = None
+answer = None
+
+
+@st.cache_resource
+def create_embeddings(openai_api_key: str):
+    """Create the shared, immutable OpenAI embedding client."""
+    return OpenAIEmbeddings(
+        model="text-embedding-ada-002",
+        openai_api_key=openai_api_key,
+    )
+
+
+@st.cache_resource
+def create_chat_model(openai_api_key: str):
+    """Create the shared, immutable chat model client."""
+    return ChatOpenAI(
+        api_key=openai_api_key,
+        model_name="gpt-4o",
+        temperature=0.0,
+    )
+
+
+@st.cache_resource
+def create_pinecone_client(pinecone_api_key: str):
+    """Create a shared Pinecone client without caching query results."""
+    return Pinecone(api_key=pinecone_api_key)
+
+
+@st.cache_resource
+def create_vector_store(index_name: str, _embeddings, pinecone_api_key: str):
+    """Create the shared vector-store connection."""
+    # The API key participates in the cache key; the SDK reads it from the environment.
+    return PineconeVectorStore(index_name=index_name, embedding=_embeddings)
+
+
+@st.cache_resource
+def create_clip_model():
+    """Load CLIP on first image analysis and reuse only the model resources."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, preprocess = clip.load("ViT-B/32", device=device)
+    model.eval()
+    return model, preprocess, device
+
+
+def load_clip_for_analysis():
+    """Load CLIP with user feedback, returning None when loading is unsafe."""
+    try:
+        with st.spinner("Loading the image-analysis model…"):
+            return create_clip_model()
+    except (MemoryError, RuntimeError):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        st.error(
+            "The image-analysis model could not be loaded with the available "
+            "memory. You can continue using symptom chat or try the image again."
+        )
+        return None
+    except Exception:
+        st.error(
+            "Image analysis is temporarily unavailable because the model failed "
+            "to load. You can continue using symptom chat and retry later."
+        )
+        return None
+
+
+def analyze_image(image_data, llm, pinecone_api_key: str):
+    """Analyze one uploaded image; all request-specific values stay local."""
+    clip_resources = load_clip_for_analysis()
+    if clip_resources is None:
+        return None
+
+    model, preprocess, device = clip_resources
+    try:
+        image_tensor = preprocess(image_data.convert("RGB")).unsqueeze(0).to(device)
+        with torch.no_grad():
+            image_features = model.encode_image(image_tensor)
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+
+        vector = image_features.cpu().numpy().flatten()
+        st.success("✅ Image converted to CLIP vector!")
+        st.write("Vector shape:", vector.shape)
+
+        index = create_pinecone_client(pinecone_api_key).Index(
+            "skindisease-symptoms-gpt-4"
+        )
+        result = index.query(
+            vector=vector.reshape(1, -1).tolist(),
+            top_k=1,
+            include_metadata=True,
+        )
+        disease = result["matches"][0]["metadata"]["Disease"]
+        st.write(disease)
+        prompt = PromptTemplate(
+            template=(
+                "Accept the user’s skin condition as input and provide probable "
+                "diagnoses and prescription for only that condition.\nText:\n{context}"
+            ),
+            input_variables=["context"],
+        )
+        answer = LLMChain(llm=llm, prompt=prompt).run(disease)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        return answer
+    except (MemoryError, RuntimeError):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        st.error(
+            "There was not enough memory to analyze this image. Try a smaller "
+            "image, switch to symptom chat, or retry later."
+        )
+    except Exception:
+        st.error("Image analysis failed. You can retry without restarting the app.")
+    return None
+INITIAL_ASSISTANT_GREETING = (
+    "Hello! MediDet AI is here to help you diagnose symptoms. "
+    "How can I assist you today?"
+)
+IMAGE_RESULT_STATE_KEYS = ("image_data", "image_result")
 
 global uploaded
 uploaded=False
@@ -317,36 +568,88 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.warning(MEDICAL_DISCLAIMER)
-acknowledged = st.checkbox(
-    "I have read and understand the medical disclaimer and want to continue.",
-    key="medical_disclaimer_acknowledged",
-)
-st.caption(
-    "Deployment requirement: the final clinical wording and escalation rules must "
-    "be reviewed and approved by appropriately qualified medical and legal/compliance "
-    "reviewers before this application is made public."
-)
-if not acknowledged:
-    st.info("Please acknowledge the disclaimer before using MediDet-AI.")
-    st.stop()
+openai_api_key = st.secrets["OPENAI_API_KEY"]
+pinecone_api_key = st.secrets["PINECONE_API_KEY"]
+os.environ["OPENAI_API_KEY"] = openai_api_key
+os.environ["PINECONE_API_KEY"] = pinecone_api_key
+def load_configuration():
+    required_keys = (
+        "OPENAI_API_KEY",
+        "PINECONE_API_KEY",
+        "TEXT_INDEX_NAME",
+        "IMAGE_INDEX_NAME",
+    )
+    values = {}
 
-config = dotenv_values("keys.env")
-os.environ['OPENAI_API_KEY'] = st.secrets["OPENAI_API_KEY"]
-os.environ['PINECONE_API_KEY'] = st.secrets["PINECONE_API_KEY"]
+    for key in required_keys:
+        try:
+            secret_value = st.secrets.get(key)
+        except Exception:
+            # Streamlit raises when no secrets file exists during local development.
+            secret_value = None
 
-index_name = "disease-symptoms-gpt-4"
+        value = secret_value or os.getenv(key)
+        if value and str(value).strip():
+            values[key] = str(value).strip()
 
+    missing_keys = [key for key in required_keys if key not in values]
+    if missing_keys:
+        st.error(f"Configuration error: missing {', '.join(missing_keys)}.")
+        st.stop()
+
+    return tuple(values[key] for key in required_keys)
+
+
+openai_api_key, pinecone_api_key, text_index_name, image_index_name = load_configuration()
+os.environ["OPENAI_API_KEY"] = openai_api_key
+os.environ["PINECONE_API_KEY"] = pinecone_api_key
+
+embeddings = create_embeddings(openai_api_key)
+llm = create_chat_model(openai_api_key)
+vectorstore = create_vector_store(index_name, embeddings, pinecone_api_key)
 embed = OpenAIEmbeddings(
 model='text-embedding-ada-002',
-openai_api_key=os.environ.get('OPEN_API_KEY')
+openai_api_key=openai_api_key
+)
+
+llm=ChatOpenAI(api_key=openai_api_key,
+                   model_name='gpt-4o',
+api_key=os.environ['OPENAI_API_KEY']
 )
 
 llm=ChatOpenAI(api_key=os.environ['OPENAI_API_KEY'],
-                   model_name='gpt-4o',
+                   model='gpt-4o',
                    temperature=0.0)
 
-vectorstore = PineconeVectorStore(index_name=index_name, embedding=embed)
+vectorstore = PineconeVectorStore(index_name=text_index_name, embedding=embed)
+
+
+def analyze_image(image_bytes: bytes) -> str:
+    """Analyze an image and return a diagnosis without mutating chat history."""
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, preprocess = clip.load("ViT-B/32", device=device)
+    image_tensor = preprocess(image).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        image_features = model.encode_image(image_tensor)
+        image_features /= image_features.norm(dim=-1, keepdim=True)
+
+    vector = image_features.cpu().numpy().flatten()
+    pc = Pinecone(api_key=os.environ['PINECONE_API_KEY'])
+    index = pc.Index("skindisease-symptoms-gpt-4")
+    result = index.query(
+        vector=vector.reshape(1, -1).tolist(),
+        top_k=1,
+        include_metadata=True,
+    )
+    condition = result['matches'][0]['metadata']['Disease']
+    prompt_template = '''Accept the user’s skin condition as input and provide probable diagnoses and prescription for only that condition.
+    Text:
+    {context}'''
+    prompt = PromptTemplate(template=prompt_template, input_variables=["context"])
+    chain = LLMChain(llm=llm, prompt=prompt)
+    return chain.run(condition)
 
 
 def present_image_match(result):
@@ -370,8 +673,9 @@ def present_image_match(result):
     return answer
 
 if "messages" not in st.session_state:
-    st.session_state["messages"] = [{"role": "assistant", "content": "Hello! MediDet-AI can provide cautious educational information about symptoms, but cannot diagnose or prescribe. How can I help?"
-}]
+    st.session_state["messages"] = [
+        {"role": "assistant", "content": INITIAL_ASSISTANT_GREETING}
+    ]
 
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
@@ -396,11 +700,30 @@ with st.sidebar:
     st.markdown("</div>", unsafe_allow_html=True)
 
     image_data = None
+    image_answer = None
+    if option == "Upload Image":
+        uploaded = st.file_uploader("Drop the evidence (jpg/png)", type=['jpg', 'png'])
+        if uploaded:
+            image_data, image_answer = analyze_skin_image(uploaded, llm)
+            if image_data is not None:
+                st.image(image_data, caption="📁 Exhibit A", use_column_width=True)
+            st.session_state.messages.append({"role": "assistant", "content": image_answer})
+
+    elif option == "Open Camera":
+        
+        cam = st.camera_input("Live Surveillance")
+        if cam:
+            image_data, image_answer = analyze_skin_image(cam, llm)
+            if image_data is not None:
+                st.image(image_data, caption="📸 Snapshot captured!", use_column_width=True)
+            st.session_state.messages.append({"role": "assistant", "content": image_answer})
+    image_data = None
     if option == "Upload Image":
         uploaded = st.file_uploader("Drop the evidence (jpg/png)", type=['jpg', 'png'])
         if uploaded:
             image = Image.open(uploaded)
             st.image(image, caption="📁 Exhibit A", use_column_width=True)
+            answer = analyze_image(image, llm, pinecone_api_key)
             image_data = image
             device = "cuda" if torch.cuda.is_available() else "cpu"
             model, preprocess = clip.load("ViT-B/32", device=device)
@@ -412,14 +735,20 @@ with st.sidebar:
                 vector = image_features.cpu().numpy().flatten()
                 st.success("✅ Image converted to CLIP vector!")
                 st.write("Vector (first 10 values):", vector.shape)
-                index_name = "skindisease-symptoms-gpt-4"
-                pc = Pinecone(api_key=os.environ['PINECONE_API_KEY'])
-                index = pc.Index(index_name)
+                pc = Pinecone(api_key=pinecone_api_key)
+                index = pc.Index(image_index_name)
                 rv=vector.reshape(1, -1)
-                result= index.query(vector=rv.tolist(), top_k=1, include_metadata=True)
-                answer = present_image_match(result)
-                if answer:
-                    st.session_state.messages.append({"role": "assistant", "content": answer})
+                result= index.query(vector=rv.flatten().tolist(), top_k=1, include_metadata=True)
+                prompt=result['matches'][0]['metadata']['Disease']
+                st.write(prompt)
+                prompt_template='''Accept the user’s skin condition as input and provide probable diagnoses and prescription for only that condition.    
+                Text:
+                {context}'''
+                PROMPT = PromptTemplate(
+                template=prompt_template,input_variables=["context"])
+                chain = PROMPT | llm
+                answer=chain.invoke({"context": prompt}).content
+                st.session_state.messages.append({"role": "assistant", "content": answer})
 
     elif option == "Open Camera":
 
@@ -427,6 +756,7 @@ with st.sidebar:
         if cam:
             image = Image.open(cam)
             st.image(image, caption="📸 Snapshot captured!", use_column_width=True)
+            answer = analyze_image(image, llm, pinecone_api_key)
             image_data = image
             device = "cuda" if torch.cuda.is_available() else "cpu"
             model, preprocess = clip.load("ViT-B/32", device=device)
@@ -438,14 +768,20 @@ with st.sidebar:
                 vector = image_features.cpu().numpy().flatten()
                 st.success("✅ Image converted to CLIP vector!")
                 st.write("Vector (first 10 values):", vector.shape)
-                index_name = "skindisease-symptoms-gpt-4"
-                pc = Pinecone(api_key=os.environ['PINECONE_API_KEY'])
-                index = pc.Index(index_name)
+                pc = Pinecone(api_key=pinecone_api_key)
+                index = pc.Index(image_index_name)
                 rv=vector.reshape(1, -1)
-                result= index.query(vector=rv.tolist(), top_k=1, include_metadata=True)
-                answer = present_image_match(result)
-                if answer:
-                    st.session_state.messages.append({"role": "assistant", "content": answer})
+                result= index.query(vector=rv.flatten().tolist(), top_k=1, include_metadata=True)
+                prompt=result['matches'][0]['metadata']['Disease']
+                st.write(prompt)
+                prompt_template='''Accept the user’s skin condition as input and provide probable diagnoses and prescription for only that condition.    
+                Text:
+                {context}'''
+                PROMPT = PromptTemplate(
+                template=prompt_template,input_variables=["context"])
+                chain = PROMPT | llm
+                answer=chain.invoke({"context": prompt}).content
+                st.session_state.messages.append({"role": "assistant", "content": answer})
 
 
 flag = st.toggle("Audio")
@@ -461,50 +797,23 @@ if not flag:
         st.markdown('<div class="typing">🕵️‍♂️ Skin Scout is investigating your case...</div>', unsafe_allow_html=True)
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
-        red_flags = detect_emergency_red_flags(prompt)
-        if red_flags:
-            answer = (
-                "## Emergency\n"
-                "Your description contains possible emergency warning signs "
-                f"({', '.join(red_flags)}). Contact your local emergency services now. "
-                "Do not wait for an online response or use this application as a substitute "
-                "for urgent care. If you can do so safely, alert someone nearby.\n\n"
-                "This is educational information, not a diagnosis or treatment plan."
-            )
-            st.session_state.messages.append({"role": "assistant", "content": answer})
-            st.chat_message("assistant").error(answer)
-        else:
-            chain = LLMChain(llm=llm, prompt=PROMPT)
-            classification = chain.run(prompt)
-        if not red_flags and re.search(r'\bYes\b', classification, flags=re.IGNORECASE):
+        chain = PROMPT | llm
+        answer=chain.invoke({"context": prompt}).content
+        if re.search(r'\bYes\b', answer):
+            prompt_template='''Accept the user’s symptoms as input and provide probable diseases, diagnoses and prescription using only the information stored in the vector database. Politely inform the user that the data is insufficient to provide a diagnosis when the given prompt is not relevant to medical symptoms.
+            Retrieved information:
+            {context}
+            User symptoms:
+            {input}'''
             PROMPT = PromptTemplate(
-                template=CLINICAL_GUIDANCE_PROMPT,
-                input_variables=["context", "question"],
+                template=prompt_template, input_variables=["context", "input"]
             )
-            retriever = VectorStoreRetriever(vectorstore=vectorstore)
-            qa_chain = RetrievalQA.from_chain_type(llm=llm,
-                    chain_type="stuff",
-                        retriever=retriever,
-                        return_source_documents=True,
-                        chain_type_kwargs={"prompt": PROMPT},)
+            document_chain = create_stuff_documents_chain(llm, PROMPT)
+            qa_chain = create_retrieval_chain(
+                vectorstore.as_retriever(), document_chain
+            )
 
-            response = qa_chain.invoke({"query": prompt})
-            answer = response["result"]
-            source_details = [
-                {
-                    "source_number": number,
-                    "metadata": source_metadata(document.metadata),
-                    "retrieved_excerpt": document.page_content[:500],
-                }
-                for number, document in enumerate(response["source_documents"], start=1)
-            ]
-            st.subheader("Retrieved evidence and source metadata")
-            st.caption(
-                "The entries below came from retrieval. The assistant response that "
-                "follows is generated guidance, not source evidence."
-            )
-            st.json(source_details)
-            st.subheader("Generated educational guidance")
+            answer = qa_chain.invoke({"input": prompt})["answer"]
             st.session_state.messages.append({"role": "assistant", "content": answer})
             st.chat_message("assistant").write(answer)
         elif not red_flags:
@@ -513,20 +822,33 @@ if not flag:
                 {context}'''
             PROMPT = PromptTemplate(
             template=prompt_template, input_variables=["context"])
-            chain = LLMChain(llm=llm, prompt=PROMPT).run(prompt)
-            st.session_state.messages.append({"role": "assistant", "content": chain})
-            st.chat_message("assistant").write(chain)
+            chain = PROMPT | llm
+            answer = chain.invoke({"context": prompt}).content
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            st.chat_message("assistant").write(answer)
 
 else:
     # Set up Streamlit app layout
     st.title("Continuous Speech to Text")
     st.title("Currently still in developing phase")
-
-if option == "Open Camera" and cam:
-        st.chat_message("assistant").write(answer)
-if uploaded:
-        st.chat_message("assistant").write(answer)
+    
+if option == "Open Camera" and cam and answer:
+if image_answer:
+        st.chat_message("assistant").write(image_answer)
 if st.button('clear'):
     h.update_one({"id": 'krrish'},{"$set": {"text": ""}})
+if option == "Open Camera" and cam:
+        st.chat_message("assistant").write(answer)
+if uploaded and answer:
+        st.chat_message("assistant").write(answer)
+if st.button('clear'):
+    st.session_state.messages = []
+if st.button("clear"):
+    st.session_state["messages"] = [
+        {"role": "assistant", "content": INITIAL_ASSISTANT_GREETING}
+    ]
+    for key in IMAGE_RESULT_STATE_KEYS:
+        st.session_state.pop(key, None)
+    st.rerun()
 
 
